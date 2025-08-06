@@ -22,7 +22,7 @@ namespace CurlClient {
 
     public class HttpClient : Object {
         public bool verbose;
-        public string? unix_socket_path {get; set;}
+        public string? unix_socket_path { get; set; }
         public string? base_url;
         private Curl.SList? headers;
 
@@ -51,6 +51,8 @@ namespace CurlClient {
             public HttpClient client;
             public GLib.StringBuilder buffer;
             public SSEMessage current_message;
+            public delegate void MessageSentCallback();
+            public MessageSentCallback? on_message_sent;
 
             public StreamingData(HttpClient client, owned SSECallback cb) {
                 this.client = client;
@@ -93,6 +95,23 @@ namespace CurlClient {
             return real_size;
         }
 
+        private static int debug_callback(
+            Curl.EasyHandle handle,
+            Curl.InfoType type,
+            uint8* data,
+            size_t size,
+            void* userdata
+        ) {
+            if (type == Curl.InfoType.HEADER_OUT) {
+                var stream_data = (StreamingData)userdata;
+                if (stream_data.on_message_sent != null) {
+                    stream_data.on_message_sent();
+                }
+            }
+            return 0;
+        }
+
+
         private static void process_sse_message(string message_text, owned StreamingData stream_data) {
             stream_data.reset_current_message();
 
@@ -114,54 +133,121 @@ namespace CurlClient {
             stream_data.callback(stream_data.current_message);
         }
 
+        public delegate void MessageSentCallback();
+
+
         public HttpClientResponse request_streaming(
             HttpClientMethod method,
             string url,
             string? post_data,
-            owned SSECallback callback
-        ) throws HttpClientError {
+            owned SSECallback callback,
+            owned MessageSentCallback? on_message_sent = null
+        ) {
             var curl = new Curl.EasyHandle();
             var response = new HttpClientResponse();
             var stream_data = new StreamingData(this, (owned)callback);
 
             Curl.Code r;
 
-            r = curl.setopt(Curl.Option.VERBOSE, this.verbose ? 1 : 0);
-            GLib.assert_true(r == Curl.Code.OK);
+            if (on_message_sent != null) {
+                stream_data.on_message_sent = (owned) on_message_sent;
+            }
+
+            r = curl.setopt(Curl.Option.DEBUGFUNCTION, debug_callback);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
+
+            r = curl.setopt(Curl.Option.DEBUGDATA, (void*)stream_data);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
+
+            r = curl.setopt(Curl.Option.VERBOSE, 1); // Must be enabled for debug callback
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
+
             r = curl.setopt(Curl.Option.URL, (this.base_url ?? "") + url);
-            GLib.assert_true(r == Curl.Code.OK);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
 
             if (unix_socket_path != null) {
                 r = curl.setopt(Curl.Option.UNIX_SOCKET_PATH, unix_socket_path);
-                GLib.assert_true(r == Curl.Code.OK);
+                if (r != Curl.Code.OK) {
+                    response.curl_code = r;
+                    response.error_message = Curl.Global.strerror(r);
+                    return response;
+                }
             }
 
             r = curl.setopt(Curl.Option.CUSTOMREQUEST, this.get_request_method(method));
-            GLib.assert_true(r == Curl.Code.OK);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
 
             if (headers != null) {
                 r = curl.setopt(Curl.Option.HTTPHEADER, headers);
-                GLib.assert_true(r == Curl.Code.OK);
+                if (r != Curl.Code.OK) {
+                    response.curl_code = r;
+                    response.error_message = Curl.Global.strerror(r);
+                    return response;
+                }
             }
 
             if (post_data != null && method == HttpClientMethod.POST) {
                 r = curl.setopt(Curl.Option.POSTFIELDS, post_data);
-                GLib.assert_true(r == Curl.Code.OK);
+                if (r != Curl.Code.OK) {
+                    response.curl_code = r;
+                    response.error_message = Curl.Global.strerror(r);
+                    return response;
+                }
             }
 
             r = curl.setopt(Curl.Option.WRITEFUNCTION, stream_write_function);
-            GLib.assert_true(r == Curl.Code.OK);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
+
             r = curl.setopt(Curl.Option.WRITEDATA, (void*)stream_data);
-            GLib.assert_true(r == Curl.Code.OK);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
 
             r = curl.setopt(Curl.Option.HTTP_TRANSFER_DECODING, 1);
-            GLib.assert_true(r == Curl.Code.OK);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
+
             r = curl.setopt(Curl.Option.ACCEPT_ENCODING, "");
-            GLib.assert_true(r == Curl.Code.OK);
+            if (r != Curl.Code.OK) {
+                response.curl_code = r;
+                response.error_message = Curl.Global.strerror(r);
+                return response;
+            }
 
             r = curl.perform();
+            response.curl_code = r;
             if (r != Curl.Code.OK) {
-                throw new HttpClientError.ERROR(Curl.Global.strerror(r));
+                response.error_message = Curl.Global.strerror(r);
+                return response;
             }
 
             long response_code = 0;
@@ -170,6 +256,7 @@ namespace CurlClient {
 
             return response;
         }
+
 
         public HttpClientResponse request(
             HttpClientMethod method,
@@ -253,6 +340,9 @@ namespace CurlClient {
 
     public class HttpClientResponse : Object {
         public int code;
+        public Curl.Code curl_code { get; set; default = Curl.Code.OK; }
+        public string? error_message { get; set; default = null; }
+
         private GLib.MemoryInputStream memory_stream;
         private GLib.DataInputStream body_data_stream;
         private size_t data_length;
@@ -288,6 +378,18 @@ namespace CurlClient {
                 }
             }
             return "";
+        }
+
+        public bool is_error() {
+            return curl_code != Curl.Code.OK;
+        }
+
+        public bool is_http_error() {
+            return code >= 400;
+        }
+
+        public bool is_http_success() {
+            return code >= 200 && code < 300;
         }
     }
 }

@@ -20,6 +20,12 @@ namespace CurlClient {
 
     public delegate void SSECallback(SSEMessage message);
 
+    public struct MultipartFile {
+        public string? filename;
+        public string? content_type;
+        public uint8[] data;
+    }
+
     public class HttpClient : Object {
         public bool verbose;
         public string? unix_socket_path { get; set; }
@@ -44,6 +50,101 @@ namespace CurlClient {
             if (headers != null) {
                 headers = null;
             }
+        }
+
+        public HttpClientResponse request_multipart(
+            string? url,
+            HashTable<string, string>? form_strings,
+            HashTable<string, MultipartFile?>? form_files
+        ) throws HttpClientError {
+            var curl = new Curl.EasyHandle();
+            var response = new HttpClientResponse();
+
+            Curl.Code r;
+
+            r = curl.setopt(Curl.Option.VERBOSE, this.verbose ? 1 : 0);
+            GLib.assert_true(r == Curl.Code.OK);
+
+            if (url != null) {
+                r = curl.setopt(Curl.Option.URL, url);
+            } else {
+                r = curl.setopt(Curl.Option.URL, this.base_url);
+            }
+            GLib.assert_true(r == Curl.Code.OK);
+
+            // Build multipart body manually
+            string boundary = "----CurlClientBoundary" + new DateTime.now_utc().to_unix().to_string();
+            var body = new StringBuilder();
+
+            if (form_strings != null) {
+                form_strings.foreach((key, val) => {
+                    body.append("--").append(boundary).append("\r\n");
+                    body.append("Content-Disposition: form-data; name=\"").append(key).append("\"\r\n\r\n");
+                    body.append(val).append("\r\n");
+                });
+            }
+
+            if (form_files != null) {
+                form_files.foreach((key, file_data) => {
+                    body.append("--").append(boundary).append("\r\n");
+                    body.append("Content-Disposition: form-data; name=\"").append(key).append("\"");
+                    if (file_data.filename != null) {
+                        body.append("; filename=\"").append(file_data.filename).append("\"");
+                    }
+                    body.append("\r\n");
+                    if (file_data.content_type != null) {
+                        body.append("Content-Type: ").append(file_data.content_type).append("\r\n");
+                    }
+                    body.append("\r\n");
+                    body.append_len((string)file_data.data, file_data.data.length);
+                    body.append("\r\n");
+                });
+            }
+
+            body.append("--").append(boundary).append("--\r\n");
+
+            // Add content-type and Expect headers to the existing headers list
+            headers = Curl.SList.append((owned)headers, "Content-Type: multipart/form-data; boundary=" + boundary);
+            headers = Curl.SList.append((owned)headers, "Expect:");  // Disable Expect: 100-continue
+            r = curl.setopt(Curl.Option.HTTPHEADER, headers);
+            GLib.assert_true(r == Curl.Code.OK);
+
+            r = curl.setopt(Curl.Option.POST, 1);
+            GLib.assert_true(r == Curl.Code.OK);
+            r = curl.setopt(Curl.Option.POSTFIELDS, body.str);
+            GLib.assert_true(r == Curl.Code.OK);
+            r = curl.setopt(Curl.Option.POSTFIELDSIZE, body.len);
+            GLib.assert_true(r == Curl.Code.OK);
+
+            r = curl.setopt(Curl.Option.WRITEDATA, (void*)response);
+            GLib.assert_true(r == Curl.Code.OK);
+            r = curl.setopt(Curl.Option.WRITEFUNCTION, HttpClientResponse.read_body_data);
+            GLib.assert_true(r == Curl.Code.OK);
+
+            r = curl.setopt(Curl.Option.HEADERDATA, (void*)response);
+            GLib.assert_true(r == Curl.Code.OK);
+            r = curl.setopt(Curl.Option.HEADERFUNCTION, HttpClientResponse.read_header_data);
+            GLib.assert_true(r == Curl.Code.OK);
+
+            r = curl.perform();
+
+            if (r == Curl.Code.OK) {
+                long response_code = 0;
+                curl.getinfo(Curl.Info.RESPONSE_CODE, &response_code);
+                response.code = (int)response_code;
+                return response;
+            }
+
+            long curl_errno = -1;
+            curl.getinfo(Curl.Info.OS_ERRNO, &curl_errno);
+
+            if (curl_errno == Posix.ENOENT) {
+                throw new HttpClientError.ERROR_NO_ENTRY(strerror((int)curl_errno));
+            } else if (curl_errno == Posix.EACCES) {
+                throw new HttpClientError.ERROR_ACCESS(strerror((int)curl_errno));
+            }
+
+            throw new HttpClientError.ERROR(Curl.Global.strerror(r));
         }
 
         private class StreamingData : GLib.Object {
@@ -301,6 +402,11 @@ namespace CurlClient {
             r = curl.setopt(Curl.Option.WRITEFUNCTION, HttpClientResponse.read_body_data);
             GLib.assert_true(r == Curl.Code.OK);
 
+            r = curl.setopt(Curl.Option.HEADERDATA, (void*)response);
+            GLib.assert_true(r == Curl.Code.OK);
+            r = curl.setopt(Curl.Option.HEADERFUNCTION, HttpClientResponse.read_header_data);
+            GLib.assert_true(r == Curl.Code.OK);
+
             r = curl.perform();
 
             // First check if the curl operation succeeded
@@ -346,12 +452,39 @@ namespace CurlClient {
         private GLib.MemoryInputStream memory_stream;
         private GLib.DataInputStream body_data_stream;
         private size_t data_length;
+        private HashTable<string, string> response_headers;
 
         public HttpClientResponse() {
             this.code = 0;
             this.memory_stream = new GLib.MemoryInputStream();
             this.body_data_stream = new GLib.DataInputStream(this.memory_stream);
             this.data_length = 0;
+            this.response_headers = new HashTable<string, string>(str_hash, str_equal);
+        }
+
+        public static size_t read_header_data(void* buf, size_t size, size_t nmemb, void* data) {
+            size_t real_size = size * nmemb;
+            var response = (HttpClientResponse)data;
+
+            uint8[] buffer = new uint8[real_size + 1];
+            Posix.memcpy((void*)buffer, buf, real_size);
+            buffer[real_size] = 0;
+
+            string header_line = ((string)buffer).strip();
+            if (header_line.length > 0 && header_line.contains(":")) {
+                int colon_pos = header_line.index_of(":");
+                if (colon_pos > 0) {
+                    string key = header_line.substring(0, colon_pos).strip();
+                    string val = header_line.substring(colon_pos + 1).strip();
+                    response.response_headers.set(key, val);
+                }
+            }
+
+            return real_size;
+        }
+
+        public string? get_header(string name) {
+            return response_headers.get(name);
         }
 
         public static size_t read_body_data(void* buf, size_t size, size_t nmemb, void* data) {
